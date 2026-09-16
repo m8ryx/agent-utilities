@@ -1,6 +1,6 @@
 ## Agent Utilities
 
-Miscellaneous tools, tips, tricks to makes working with agents a bit easier.
+Miscellaneous tools, tips, tricks to make working with agents a bit easier.
 
 ## The Goods
 
