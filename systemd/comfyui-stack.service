@@ -1,0 +1,20 @@
+# Host-specific: change User=, Environment=HOME= and WorkingDirectory=
+# to match your account before installing.
+[Unit]
+Description=vLLM + LiteLLM inference stack
+Requires=docker.service
+After=docker.service tailscaled.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=youruser
+Environment=HOME=/home/youruser
+WorkingDirectory=/home/youruser/comfyui
+ExecStartPre=/usr/local/bin/wait-tailscale-ip
+ExecStart=/usr/bin/docker compose up -d --wait --wait-timeout 900
+ExecStop=/usr/bin/docker compose stop
+TimeoutStartSec=1200
+
+[Install]
+WantedBy=multi-user.target

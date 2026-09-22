@@ -1,0 +1,17 @@
+# Secrets — GEMINI_API_KEY and anything else compose substitutes.
+.env
+*.env
+!example.env
+
+# Bind-mounted runtime state. Models are tens of GB; user/ holds the
+# SQLite DB; cache/ holds HuggingFace, pip and Triton JIT artifacts.
+models/
+output/
+input/
+user/
+cache/
+custom_nodes/*
+!custom_nodes/comfyui-gemini-own-key/
+
+__pycache__/
+*.pyc

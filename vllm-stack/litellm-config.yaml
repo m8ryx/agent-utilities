@@ -1,0 +1,69 @@
+# LiteLLM routing: local vLLM for high-volume grunt work, Claude for reasoning.
+# Everything downstream talks to one OpenAI-compatible endpoint at :4000.
+
+model_list:
+  # ---- Local inference (RTX 5090) ----
+  - model_name: local-workhorse
+    litellm_params:
+      model: hosted_vllm/qwen3-35b
+      api_base: http://vllm:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+      # No per-token cost, but set rpm so a runaway agent loop doesn't
+      # queue thousands of requests against a single GPU.
+      rpm: 600
+
+  # Same weights, thinking disabled. Qwen3.6 reasons by default, which on a
+  # trivial prompt costs ~131 reasoning tokens and 0.70s vs 3 tokens and
+  # 0.098s with it off. Use this for routing, classification, extraction —
+  # anything where the reasoning trace is pure overhead.
+  - model_name: local-fast
+    litellm_params:
+      model: hosted_vllm/qwen3-35b
+      api_base: http://vllm:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+      rpm: 600
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
+
+  # ---- Claude API ----
+  - model_name: orchestrator
+    litellm_params:
+      model: anthropic/claude-opus-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: claude-fast
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+router_settings:
+  routing_strategy: simple-shuffle
+  # If the local box is down, mid-rebuild, or swapping models, fall through
+  # to Claude rather than failing the request. This is the main reason to
+  # put a proxy in front rather than pointing clients straight at vLLM.
+  fallbacks:
+    - local-workhorse: ["claude-fast"]
+    - local-fast: ["claude-fast"]
+  num_retries: 2
+  timeout: 600
+  allowed_fails: 3
+  cooldown_time: 60
+
+litellm_settings:
+  callbacks: custom_handler.proxy_handler_instance
+  drop_params: true          # silently drop params vLLM doesn't accept
+  modify_params: true
+  set_verbose: false
+  # Uncomment once you add a Redis container; caches identical prompts
+  # across agent runs, which matters a lot for fan-out workloads.
+  # cache: true
+  # cache_params:
+  #   type: redis
+  #   host: redis
+  #   port: 6379
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+
+

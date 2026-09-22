@@ -1,0 +1,141 @@
+# vLLM + LiteLLM stack for RTX 5090 (Blackwell / sm_120) on Pop!_OS 24.04
+#
+# Prereqs:
+#   1. NVIDIA open kernel modules installed (modinfo nvidia | grep license -> Dual MIT/GPL)
+#   2. NVIDIA Container Toolkit configured:
+#        sudo nvidia-ctk runtime configure --runtime=docker
+#        sudo systemctl restart docker
+#   3. Smoke test:
+#        docker run --rm --gpus all nvidia/cuda:13.0.0-base-ubuntu24.04 nvidia-smi
+#
+# Set TS_IP in .env to your Tailscale IP (tailscale ip -4) so LiteLLM is not
+# published on the LAN. Set VLLM_API_KEY and LITELLM_MASTER_KEY to random strings.
+
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: vllm
+    restart: on-failure
+
+    ports:
+      - "127.0.0.1:8000:8000"
+
+    # No published ports. Only reachable from the internal network by LiteLLM.
+    networks:
+      - inference
+
+    # --ipc=host is required: vLLM uses large shared-memory segments for
+    # tensor passing between worker processes. Without it you get cryptic
+    # crashes on model load.
+    ipc: host
+
+    volumes:
+      # Persist model weights across container rebuilds. Without this you
+      # re-download 15-20GB every time you touch the image tag.
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+
+    environment:
+      # FlashInfer is the attention backend that behaves best on sm_120.
+      # FlashAttention has had symbol/kernel issues on Blackwell.
+      - VLLM_ATTENTION_BACKEND=FLASHINFER
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      - VLLM_API_KEY=${VLLM_API_KEY}
+
+    devices:
+      - nvidia.com/gpu=all
+
+    command: >
+      QuantTrio/Qwen3.6-35B-A3B-AWQ
+      --served-model-name qwen3-35b
+      --quantization awq_marlin
+      --dtype bfloat16
+      --gpu-memory-utilization 0.88
+      --max-model-len 65536
+      --max-num-batched-tokens 8192
+      --max-num-seqs 4
+      --host 0.0.0.0
+      --port 8000
+      --reasoning-parser qwen3
+      --enable-auto-tool-choice
+      --tool-call-parser qwen3_coder
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      # Generous: open-kernel-module GPU init plus weight load is slow on
+      # first start. Run nvidia-persistenced to cut this down.
+      start_period: 600s
+      retries: 3
+
+  postgres:
+    image: postgres:18-alpine
+    container_name: litellm-db
+    restart: on-failure
+
+    networks:
+      - inference
+
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+    # Named volume, not a bind mount. Postgres is picky about permissions and
+    # ownership on host directories; a named volume sidesteps that entirely.
+    # This is what makes the data survive `docker compose down`.
+    volumes:
+      - litellm-pgdata:/var/lib/postgresql
+
+    # LiteLLM runs schema migrations on startup. If it starts before Postgres
+    # is accepting connections, it crashes. This is what depends_on hangs off.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  litellm:
+    image: ghcr.io/berriai/litellm:v1.98.0
+    container_name: litellm
+    restart: on-failure
+    depends_on:
+      vllm:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+    networks:
+      - inference
+
+    # Bound to the Tailscale interface only. Change to 127.0.0.1 if you want
+    # it purely local, or 0.0.0.0 if you genuinely want LAN exposure.
+    ports:
+      - "${TS_IP}:4000:4000"
+
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro
+      - ./custom_handler.py:/app/custom_handler.py:ro
+
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - VLLM_API_KEY=${VLLM_API_KEY}
+      - DATABASE_URL=postgresql://litellm:${POSTGRES_PASSWORD}@postgres:5432/litellm
+
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+
+
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=5).status == 200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+networks:
+  inference:
+    driver: bridge
+
+volumes:
+  litellm-pgdata:
