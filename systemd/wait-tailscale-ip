@@ -1,0 +1,14 @@
+#!/bin/sh
+# Block until tailscale0 holds a 100.x address, up to 60s.
+# Needed because tailscaled.service goes "active" ~13s before the
+# control-plane handshake assigns the address.
+i=0
+while [ "$i" -lt 60 ]; do
+    if ip -4 addr show tailscale0 2>/dev/null | grep -q 'inet 100\.'; then
+        exit 0
+    fi
+    i=$((i + 1))
+    sleep 1
+done
+echo "tailscale0 never got a 100.x address" >&2
+exit 1

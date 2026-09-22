@@ -1,0 +1,40 @@
+name: comfyui
+
+services:
+  comfyui:
+    build:
+      context: .
+      args:
+        COMFYUI_REF: v0.35.1
+        UID: "1000"
+        GID: "1000"
+    image: comfyui:v0.35.1
+    container_name: comfyui
+    restart: on-failure
+    gpus: all
+    # Tailscale interface only — ComfyUI has NO authentication.
+    ports:
+      - "${TS_IP}:8188:8188"
+    environment:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # Both JIT caches default to paths OUTSIDE the persisted .cache mount
+      # (~/.triton/cache and /tmp/torchinductor_*). Left alone, every
+      # container recreate discards compiled kernels and pays the
+      # recompilation cost again on the next generation.
+      TRITON_CACHE_DIR: /home/ubuntu/.cache/triton
+      TORCHINDUCTOR_CACHE_DIR: /home/ubuntu/.cache/torchinductor
+      # Read from ./.env (mode 600, never baked into the image). Lets the
+      # Gemini node bill your own Google account instead of Comfy credits.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    volumes:
+      - ./models:/opt/comfyui/models
+      - ./input:/opt/comfyui/input
+      - ./output:/opt/comfyui/output
+      - ./user:/opt/comfyui/user
+      - ./custom_nodes:/opt/comfyui/custom_nodes
+      # HOME is /home/ubuntu in this image. HuggingFace, torch.hub and
+      # insightface downloads land here — tens of GB, re-fetched on every
+      # recreate unless persisted. Also keeps the pip cache warm so the
+      # entrypoint's dependency pass is fast.
+      - ./cache:/home/ubuntu/.cache

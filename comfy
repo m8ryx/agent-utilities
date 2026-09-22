@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""comfy — ComfyUI model and workflow management.
+
+Models are fetched server-side, directly into the bind-mounted models tree.
+The browser is only a UI; there is no reason for weights to travel via the
+machine running it.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.parse
+from pathlib import Path
+
+COMFY_DIR = Path.home() / "comfyui"
+MODELS = COMFY_DIR / "models"
+CONTAINER = "comfyui"
+CONTAINER_MODELS = "/opt/comfyui/models"
+ENV_FILES = [Path.home() / "vllm-stack" / ".env", COMFY_DIR / ".env"]
+
+_tty = sys.stdout.isatty()
+DIM = "\033[2m" if _tty else ""
+BOLD = "\033[1m" if _tty else ""
+GREEN = "\033[32m" if _tty else ""
+RED = "\033[31m" if _tty else ""
+OFF = "\033[0m" if _tty else ""
+
+
+def say(m): print(f"{DIM}::{OFF} {m}", flush=True)
+
+
+def die(m, code=1):
+    print(f"{RED}error:{OFF} {m}", file=sys.stderr)
+    sys.exit(code)
+
+
+def human(n):
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}P"
+
+
+def load_token(name):
+    """Read a token from the environment, else from the stack .env files."""
+    if os.environ.get(name):
+        return os.environ[name]
+    for f in ENV_FILES:
+        if not f.exists():
+            continue
+        for line in f.read_text().splitlines():
+            if line.startswith(f"{name}="):
+                v = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if v:
+                    return v
+    return None
+
+
+def model_dirs():
+    if not MODELS.is_dir():
+        die(f"{MODELS} not found")
+    return sorted(d.name for d in MODELS.iterdir() if d.is_dir())
+
+
+def container_running():
+    r = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", CONTAINER],
+                       capture_output=True, text=True)
+    return r.stdout.strip() == "true"
+
+
+def resolve_dest(name):
+    dirs = model_dirs()
+    if name in dirs:
+        return name
+    matches = [d for d in dirs if d.startswith(name)]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        die(f"unknown model dir '{name}'. known: {', '.join(dirs)}")
+    die(f"ambiguous '{name}': {', '.join(matches)}")
+
+
+def flatten_into(dest_dir: Path, before: set):
+    """hf download recreates repo structure; lift new files to the top level.
+
+    hf also writes bookkeeping into .cache/ (lock files, .metadata, a
+    CACHEDIR.TAG). Prune that FIRST — flattening before pruning drags the
+    bookkeeping up into the models tree where ComfyUI will list it.
+    """
+    JUNK_SUFFIXES = (".lock", ".metadata")
+    JUNK_NAMES = {"CACHEDIR.TAG", ".gitignore", ".gitattributes"}
+
+    shutil.rmtree(dest_dir / ".cache", ignore_errors=True)
+
+    moved = []
+    for p in sorted(dest_dir.rglob("*")):
+        if not p.is_file() or p in before or p.parent == dest_dir:
+            continue
+        if any(part.startswith(".") for part in p.relative_to(dest_dir).parts):
+            continue
+        if p.name in JUNK_NAMES or p.name.endswith(JUNK_SUFFIXES):
+            continue
+        target = dest_dir / p.name
+        if target.exists():
+            continue
+        p.rename(target)
+        moved.append(target.name)
+
+    for p in sorted(dest_dir.rglob("*"), key=lambda x: -len(x.parts)):
+        if p.is_dir() and not any(p.iterdir()):
+            p.rmdir()
+    return moved
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_dirs(args):
+    print()
+    for d in model_dirs():
+        files = [f for f in (MODELS / d).rglob("*") if f.is_file()]
+        total = sum(f.stat().st_size for f in files)
+        note = f"{len(files)} file(s), {human(total)}" if files else f"{DIM}empty{OFF}"
+        print(f"  {BOLD}{d:<20}{OFF} {note}")
+    print()
+    return 0
+
+
+def cmd_models(args):
+    any_found = False
+    for d in model_dirs():
+        files = sorted((f for f in (MODELS / d).rglob("*") if f.is_file()),
+                       key=lambda f: -f.stat().st_size)
+        if not files:
+            continue
+        any_found = True
+        print(f"\n  {BOLD}{d}{OFF}")
+        for f in files:
+            rel = f.relative_to(MODELS / d)
+            print(f"    {human(f.stat().st_size):>8}  {rel}")
+    print("" if any_found else f"\n  {DIM}no models installed yet{OFF}")
+    print()
+    return 0
+
+
+def cmd_pull(args):
+    dest = resolve_dest(args.to)
+    dest_dir = MODELS / dest
+    src = args.source
+
+    if src.startswith(("http://", "https://")):
+        spec = hf_spec_from_url(src)
+        if spec:
+            repo, path_in_repo, rev = spec
+            say(f"HuggingFace URL {DIM}->{OFF} hf:{repo}:{path_in_repo}")
+            return pull_hf(f"{repo}:{path_in_repo}", dest_dir, args, revision=rev)
+        return pull_url(src, dest_dir, args)
+    return pull_hf(src, dest_dir, args)
+
+
+def pull_hf(src, dest_dir, args, revision=None):
+    """hf:repo/name[:path/in/repo] — fetched inside the container."""
+    spec = src[3:] if src.startswith("hf:") else src
+    repo, _, path_in_repo = spec.partition(":")
+    if "/" not in repo:
+        die(f"'{repo}' is not a repo id (expected owner/name)")
+    if not container_running():
+        die(f"container '{CONTAINER}' is not running — start it with `gpu comfy`")
+
+    token = load_token("HF_TOKEN")
+    if not token:
+        say("no HF_TOKEN found; gated repos will fail")
+
+    # The token arrives on stdin, never in argv: `docker exec -e VAR=secret`
+    # publishes the secret to anyone who can run ps on this host.
+    shim = ('IFS= read -r HF_TOKEN || true\n'
+            'if [ -n "$HF_TOKEN" ]; then export HF_TOKEN; else unset HF_TOKEN; fi\n'
+            'exec hf download "$@"\n')
+    cmd = ["docker", "exec", "-i", CONTAINER, "sh", "-c", shim, "hf-download", repo]
+    if path_in_repo:
+        cmd += [path_in_repo]
+    cmd += ["--local-dir", f"{CONTAINER_MODELS}/{dest_dir.name}"]
+    if revision and revision != "main":
+        cmd += ["--revision", revision]
+
+    say(f"{repo}{':' + path_in_repo if path_in_repo else ''} {DIM}->{OFF} models/{dest_dir.name}/")
+    if not path_in_repo:
+        say("no file given — this pulls the WHOLE repo, which may be very large")
+
+    before = {p for p in dest_dir.rglob("*") if p.is_file()}
+    r = subprocess.run(cmd, input=f"{token or ''}\n".encode())
+    if r.returncode != 0:
+        die(f"hf download failed (exit {r.returncode})", r.returncode)
+
+    moved = flatten_into(dest_dir, before)
+    for m in moved:
+        say(f"flattened {DIM}->{OFF} {m}")
+    print(f"{GREEN}done{OFF}  models/{dest_dir.name}/")
+    return 0
+
+
+MODEL_SUFFIXES = (".safetensors", ".ckpt", ".pt", ".pth", ".bin",
+                  ".gguf", ".sft", ".onnx")
+
+
+def parse_content_disposition(headers_text):
+    """Pull a filename out of Content-Disposition, last header wins.
+
+    Redirect chains emit one set of headers per hop; the filename belongs to
+    the final response. RFC 5987's filename*= is percent-encoded and takes
+    precedence over the plain form when both are present.
+    """
+    best = None
+    for line in headers_text.splitlines():
+        if not line.lower().startswith("content-disposition:"):
+            continue
+        value = line.split(":", 1)[1].strip()
+        m = re.search(r"filename\*\s*=\s*[^']*'[^']*'([^;\s]+)", value, re.I)
+        if m:
+            best = urllib.parse.unquote(m.group(1))
+            continue
+        m = re.search(r'filename\s*=\s*"([^"]+)"', value, re.I)
+        if m:
+            best = m.group(1)
+            continue
+        m = re.search(r"filename\s*=\s*([^;\s]+)", value, re.I)
+        if m:
+            best = m.group(1)
+    return best
+
+
+def safe_basename(name):
+    """A server-supplied filename is untrusted — never let it escape dest_dir."""
+    if not name:
+        return None
+    name = os.path.basename(name.strip().strip('"').strip("'"))
+    if name in ("", ".", "..") or name.startswith("."):
+        return None
+    return name
+
+
+def probe_filename(url, hdr_args, stdin_conf=None):
+    """Ask the server what it calls this file, before downloading it."""
+    r = subprocess.run(["curl", "-sIL", "--max-time", "30", *hdr_args, url],
+                       capture_output=True, text=True, input=stdin_conf)
+    name = parse_content_disposition(r.stdout) if r.returncode == 0 else None
+    if name:
+        return safe_basename(name)
+    # Some origins reject HEAD outright. Ask for a single byte instead and
+    # read the headers off that.
+    r = subprocess.run(["curl", "-sL", "--max-time", "30", "-r", "0-0",
+                        "-D", "-", "-o", os.devnull, *hdr_args, url],
+                       capture_output=True, text=True, input=stdin_conf)
+    if r.returncode != 0:
+        return None
+    return safe_basename(parse_content_disposition(r.stdout))
+
+
+HF_URL_RE = re.compile(
+    r"^https?://(?:www\.)?huggingface\.co/"
+    r"(?P<repo>[^/]+/[^/]+)/(?:resolve|blob)/(?P<rev>[^/]+)/(?P<path>[^?#]+)",
+    re.I)
+
+
+def hf_spec_from_url(url):
+    """Recognise a HuggingFace file URL and return (repo, path, revision).
+
+    ComfyUI's missing-models dialog hands out plain URLs, so this is the form
+    people actually paste. Routing them through `hf` instead of curl buys
+    parallel chunked transfer, resume across interruptions, and a download
+    that outlives the shell that started it.
+    """
+    m = HF_URL_RE.match(url)
+    if not m:
+        return None
+    return (m.group("repo"),
+            urllib.parse.unquote(m.group("path")),
+            m.group("rev"))
+
+
+def normalize_url(url):
+    """Fix the URL form people actually copy out of the address bar.
+
+    huggingface.co/<repo>/blob/<rev>/<file> is the HTML page for a file.
+    The file itself is at /resolve/. Downloading the blob URL yields a few
+    hundred KB of webpage saved under a .safetensors name.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.netloc.endswith("huggingface.co") and "/blob/" in parsed.path:
+        fixed = parsed._replace(path=parsed.path.replace("/blob/", "/resolve/", 1))
+        return urllib.parse.urlunparse(fixed), True
+    return url, False
+
+
+def looks_like_markup(path: Path):
+    """True if the downloaded file is an HTML/XML error page, not weights."""
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(1024)
+    except OSError:
+        return False
+    text = head.decode("utf-8", "ignore").lstrip().lower()
+    return (text.startswith(("<!doctype", "<html", "<?xml", "<head"))
+            or "<html" in text[:512])
+
+
+def pull_url(url, dest_dir, args):
+    """Direct URL, including Civitai. Runs on the host; curl resumes."""
+    url, rewritten = normalize_url(url)
+    if rewritten:
+        say(f"rewrote /blob/ {DIM}->{OFF} /resolve/ (blob serves the web page)")
+    # curl reads the auth header from a stdin config (-K -) rather than argv,
+    # so the token never appears in the process list.
+    hdr_args, curl_stdin = [], None
+    if "civitai.com" in url:
+        token = load_token("CIVITAI_TOKEN")
+        if token:
+            hdr_args = ["-K", "-"]
+            curl_stdin = f'header = "Authorization: Bearer {token}"\n'.encode()
+        else:
+            say("no CIVITAI_TOKEN found; restricted models return HTML, not weights")
+
+    name = safe_basename(args.name)
+    if not name:
+        # Civitai links end in a numeric id, not a filename, so ask the
+        # server before falling back to guessing from the path.
+        say("resolving filename from server...")
+        name = probe_filename(url, hdr_args, 
+                              curl_stdin.decode() if curl_stdin else None)
+        if name:
+            say(f"server calls it {BOLD}{name}{OFF}")
+    if not name:
+        guess = safe_basename(url.split("/")[-1].split("?")[0])
+        if guess and guess.endswith(MODEL_SUFFIXES):
+            name = guess
+    if not name:
+        die("could not determine a filename — the server sent no "
+            "Content-Disposition and the URL has none. Pass --name.")
+
+    if not name.endswith(MODEL_SUFFIXES):
+        say(f"warning: '{name}' has no recognised model extension; "
+            "ComfyUI may not list it")
+
+    out = dest_dir / name
+    say(f"{url} {DIM}->{OFF} models/{dest_dir.name}/{name}")
+    r = subprocess.run(["curl", "-L", "--fail", "--progress-bar", "-C", "-",
+                        "-o", str(out), *hdr_args, url], input=curl_stdin)
+    if r.returncode != 0:
+        die(f"download failed (exit {r.returncode})", r.returncode)
+
+    size = out.stat().st_size if out.exists() else 0
+
+    # Leaving an error page on disk under a .safetensors name is worse than
+    # failing: ComfyUI lists it, and the load error points at the model
+    # rather than at the download.
+    if looks_like_markup(out):
+        out.unlink(missing_ok=True)
+        die(f"server returned an HTML page ({human(size)}), not weights — discarded.\n"
+            "       Check the URL points at the file itself, and that any\n"
+            "       required token is set.")
+    if size < 1_000_000:
+        say(f"{RED}warning{OFF}: only {human(size)} — small for a model; verify it loaded")
+
+    print(f"{GREEN}done{OFF}  {human(size)}  models/{dest_dir.name}/{name}")
+    return 0
+
+
+EPILOG = """\
+examples:
+  comfy dirs
+  comfy pull hf:Comfy-Org/flux1-dev:flux1-dev-fp8.safetensors --to checkpoints
+  comfy pull hf:stabilityai/sdxl-vae:sdxl_vae.safetensors --to vae
+  comfy pull https://civitai.com/api/download/models/12345 --to loras --name x.safetensors
+  comfy models
+
+notes:
+  HuggingFace pulls run inside the container, which already has the hf CLI,
+  and write straight to the bind-mounted models tree. Nothing transits the
+  machine running your browser.
+
+  HF_TOKEN and CIVITAI_TOKEN are read from the environment, then from
+  ~/vllm-stack/.env and ~/comfyui/.env.
+
+  ComfyUI rescans on demand — use the refresh control in the UI, or reload
+  the page, after pulling. No restart needed.
+"""
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="comfy",
+        description="ComfyUI model management — fetch weights server-side on the GPU host.",
+        epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command", metavar="<command>")
+
+    pull = sub.add_parser("pull", help="download a model into the models tree",
+                          description="Download a model server-side into models/.")
+    pull.add_argument("source", help="hf:owner/repo[:file] or an https:// URL")
+    pull.add_argument("--to", default="checkpoints", metavar="DIR",
+                      help="models subdir (default: checkpoints; prefixes accepted)")
+    pull.add_argument("--name", metavar="FILE",
+                      help="override the filename (URL downloads only; normally\n                            resolved from Content-Disposition)")
+    pull.set_defaults(func=cmd_pull)
+
+    m = sub.add_parser("models", help="list installed models with sizes")
+    m.set_defaults(func=cmd_models)
+
+    d = sub.add_parser("dirs", help="list model subdirs and what is in them")
+    d.set_defaults(func=cmd_dirs)
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if not getattr(args, "command", None):
+        parser.print_help()
+        return 0
+    if not shutil.which("docker"):
+        die("docker not found on PATH")
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

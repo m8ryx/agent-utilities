@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""gpu — RTX 5090 allocation control.
+
+The card is 32 GB and two things want it: the vLLM inference stack and
+ComfyUI. This arbitrates between them.
+
+Modes:
+  vllm    exclusive inference  — vLLM at its configured utilization
+  comfy   exclusive generation — vLLM down, whole card to ComfyUI
+  both    shared               — vLLM capped, remainder left for ComfyU - NOT AVAILABLE until functional split is available
+
+Stopping vLLM is safe: LiteLLM stays up and its fallback chain routes
+local-workhorse/local-fast to claude-fast while the local model is away.
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+VLLM_DIR = HOME / "vllm-stack"
+COMFY_DIR = HOME / "comfyui"
+
+VLLM_HEALTH = "http://127.0.0.1:8000/health"
+COMFY_PORT = 8188
+DEFAULT_SPLIT = 0.45
+
+# ANSI, suppressed when not a tty so output stays clean in pipes and logs.
+_tty = sys.stdout.isatty()
+DIM = "\033[2m" if _tty else ""
+BOLD = "\033[1m" if _tty else ""
+GREEN = "\033[32m" if _tty else ""
+YELLOW = "\033[33m" if _tty else ""
+RED = "\033[31m" if _tty else ""
+OFF = "\033[0m" if _tty else ""
+
+
+def say(msg):
+    print(f"{DIM}::{OFF} {msg}", flush=True)
+
+
+def die(msg, code=1):
+    print(f"{RED}error:{OFF} {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def compose(project_dir, *args, check=True, env=None):
+    """Run docker compose against one project directory."""
+    cmd = ["docker", "compose", "-f", str(project_dir / "docker-compose.yml"), *args]
+    merged = {**os.environ, **(env or {})}
+    return subprocess.run(cmd, check=check, env=merged)
+
+
+def container_state(name):
+    """running / exited / absent."""
+    r = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Status}}", name],
+        capture_output=True, text=True,
+    )
+    return r.stdout.strip() if r.returncode == 0 else "absent"
+
+
+def vram():
+    """(used_mib, total_mib) or None if nvidia-smi is unavailable."""
+    if not shutil.which("nvidia-smi"):
+        return None
+    r = subprocess.run(
+        ["nvidia-smi", "--query-gpu=memory.used,memory.total",
+         "--format=csv,noheader,nounits"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return None
+    used, total = (int(x) for x in r.stdout.strip().split(",")[:2])
+    return used, total
+
+
+def gpu_procs():
+    r = subprocess.run(
+        ["nvidia-smi", "--query-compute-apps=process_name,used_memory",
+         "--format=csv,noheader,nounits"],
+        capture_output=True, text=True,
+    )
+    out = []
+    for line in r.stdout.strip().splitlines():
+        if not line.strip():
+            continue
+        name, mem = (p.strip() for p in line.rsplit(",", 1))
+        out.append((name, int(mem)))
+    return sorted(out, key=lambda p: -p[1])
+
+
+def ts_ip():
+    """Tailscale IP: prefer the stack's .env, fall back to the daemon."""
+    env_file = VLLM_DIR / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            if line.startswith("TS_IP="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    r = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True)
+    return r.stdout.strip().splitlines()[0] if r.returncode == 0 else "127.0.0.1"
+
+
+def probe(url, timeout=2):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def wait_ready(url, label, timeout):
+    """Poll until healthy. Returns elapsed seconds, or None on timeout."""
+    start = time.monotonic()
+    say(f"waiting for {label} (timeout {timeout}s)...")
+    while time.monotonic() - start < timeout:
+        if probe(url):
+            elapsed = time.monotonic() - start
+            print(f"{GREEN}ready{OFF}  {label} in {BOLD}{elapsed:.0f}s{OFF}")
+            return elapsed
+        time.sleep(2)
+    print(f"{YELLOW}timeout{OFF}  {label} not ready after {timeout}s", file=sys.stderr)
+    return None
+
+
+def comfy_url():
+    return f"http://{ts_ip()}:{COMFY_PORT}/system_stats"
+
+
+def require(project_dir):
+    if not (project_dir / "docker-compose.yml").exists():
+        die(f"no docker-compose.yml in {project_dir}")
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_status(args):
+    mem = vram()
+    if mem:
+        used, total = mem
+        pct = 100 * used / total
+        bar_w = 32
+        filled = round(bar_w * used / total)
+        colour = RED if pct > 85 else (YELLOW if pct > 55 else GREEN)
+        print(f"\n  {BOLD}VRAM{OFF}  {colour}{'█' * filled}{DIM}{'·' * (bar_w - filled)}{OFF}"
+              f"  {used:,} / {total:,} MiB  ({pct:.0f}%)")
+        print(f"        {DIM}{total - used:,} MiB free{OFF}\n")
+    else:
+        print(f"\n  {YELLOW}nvidia-smi unavailable{OFF}\n")
+
+    states = {n: container_state(n) for n in ("vllm", "litellm", "comfyui")}
+    health = {
+        "vllm": probe(VLLM_HEALTH),
+        "comfyui": probe(comfy_url()),
+    }
+    print(f"  {BOLD}services{OFF}")
+    for name in ("vllm", "comfyui", "litellm"):
+        st = states[name]
+        mark = GREEN + "●" + OFF if st == "running" else DIM + "○" + OFF
+        note = ""
+        if name in health and st == "running":
+            note = f"  {DIM}health:{OFF} " + (f"{GREEN}ok{OFF}" if health[name]
+                                              else f"{YELLOW}starting{OFF}")
+        print(f"    {mark} {name:<9} {st}{note}")
+
+    procs = gpu_procs()
+    if procs:
+        print(f"\n  {BOLD}on the card{OFF}")
+        for name, mem_mib in procs:
+            print(f"    {DIM}·{OFF} {Path(name).name:<28} {mem_mib:>6,} MiB")
+
+    # Infer mode from observed state rather than storing it anywhere.
+    v, c = states["vllm"] == "running", states["comfyui"] == "running"
+    mode = ("both" if v and c else "vllm" if v else "comfy" if c else "idle")
+    print(f"\n  {BOLD}mode{OFF}  {mode}\n")
+    return 0
+
+
+def cmd_comfy(args):
+    require(COMFY_DIR)
+    if container_state("vllm") == "running":
+        say("stopping vllm (litellm falls back to claude-fast)")
+        compose(VLLM_DIR, "stop", "vllm")
+    else:
+        say("vllm already down")
+    say("starting comfyui")
+    compose(COMFY_DIR, "up", "-d")
+    wait_ready(comfy_url(), "comfyui", args.timeout)
+    print(f"  {DIM}http://{ts_ip()}:{COMFY_PORT}{OFF}")
+    return 0
+
+
+def cmd_vllm(args):
+    require(VLLM_DIR)
+    if container_state("comfyui") == "running":
+        say("stopping comfyui")
+        compose(COMFY_DIR, "stop", check=False)
+    say("starting vllm at its configured utilization")
+    compose(VLLM_DIR, "up", "-d", "vllm")
+    wait_ready(VLLM_HEALTH, "vllm", args.timeout)
+    return 0
+
+
+def cmd_both(args):
+    """Shared card: cap vLLM so ComfyUI has a standing reservation.
+
+    Requires the compose command to read ${VLLM_GPU_UTIL:-0.88}; without
+    that hook the cap is silently ignored, so check before recreating.
+    """
+    require(VLLM_DIR)
+    compose_src = (VLLM_DIR / "docker-compose.yml").read_text()
+    if "VLLM_GPU_UTIL" not in compose_src:
+        die("vllm-stack/docker-compose.yml does not read ${VLLM_GPU_UTIL}.\n"
+            "       Change the command line to:\n"
+            "         --gpu-memory-utilization ${VLLM_GPU_UTIL:-0.88}\n"
+            "       then re-run. Without it this would recreate vllm at 0.88\n"
+            "       and leave nothing for ComfyUI.")
+
+    split = args.split
+    if not 0.1 <= split <= 0.95:
+        die(f"--split {split} out of range (0.1-0.95)")
+    mem = vram()
+    if mem:
+        reserved = int(mem[1] * split)
+        say(f"vllm capped at {split:.2f} (~{reserved:,} MiB), "
+            f"~{mem[1] - reserved:,} MiB left for comfyui")
+
+    say("recreating vllm (this reloads the model — expect minutes, not seconds)")
+    compose(VLLM_DIR, "up", "-d", "--force-recreate", "vllm",
+            env={"VLLM_GPU_UTIL": str(split)})
+    wait_ready(VLLM_HEALTH, "vllm", args.timeout)
+
+    require(COMFY_DIR)
+    say("starting comfyui")
+    compose(COMFY_DIR, "up", "-d")
+    wait_ready(comfy_url(), "comfyui", args.timeout)
+    return 0
+
+
+def cmd_off(args):
+    for name, d in (("comfyui", COMFY_DIR), ("vllm", VLLM_DIR)):
+        if container_state(name) == "running":
+            say(f"stopping {name}")
+            if name == "vllm":
+                compose(d, "stop", "vllm", check=False)
+            else:
+                compose(d, "stop", check=False)
+    say("litellm left running; local tiers will fall back to claude-fast")
+    return 0
+
+
+EPILOG = f"""\
+examples:
+  gpu status              what holds the card right now
+  gpu comfy               hand the whole card to ComfyUI
+  gpu vllm                hand it back to inference
+  gpu both --split 0.5    run both, vLLM capped at 50%
+
+notes:
+  Stopping vLLM is safe — LiteLLM stays up and falls back to claude-fast.
+  Do not run a bare `docker compose up -d` in {VLLM_DIR} while in comfy
+  mode; litellm's depends_on will pull vllm back up and take the VRAM.
+  Use `docker compose up -d --no-deps litellm` instead.
+"""
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="gpu",
+        description="RTX 5090 allocation control — arbitrate the card between "
+                    "vLLM inference and ComfyUI.",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="command", metavar="<command>")
+
+    def add(name, fn, help_text, timeout_default):
+        sp = sub.add_parser(name, help=help_text, description=help_text)
+        sp.add_argument("--timeout", type=int, default=timeout_default,
+                        metavar="S", help=f"readiness timeout (default {timeout_default}s)")
+        sp.set_defaults(func=fn)
+        return sp
+
+    s = sub.add_parser("status", help="show VRAM, services, and current mode")
+    s.set_defaults(func=cmd_status)
+
+    add("comfy", cmd_comfy, "exclusive ComfyUI — stop vLLM, start ComfyUI", 120)
+    add("vllm", cmd_vllm, "exclusive inference — stop ComfyUI, start vLLM", 600)
+
+    b = add("both", cmd_both, "run both, capping vLLM to leave ComfyUI room - NOT AVAILABLE until functional split is available", 600)
+    b.add_argument("--split", type=float, default=DEFAULT_SPLIT, metavar="F",
+                   help=f"vLLM gpu-memory-utilization (default {DEFAULT_SPLIT})")
+
+    o = sub.add_parser("off", help="stop both vLLM and ComfyUI")
+    o.set_defaults(func=cmd_off)
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if not getattr(args, "command", None):
+        parser.print_help()
+        return 0
+    if not shutil.which("docker"):
+        die("docker not found on PATH")
+    try:
+        return args.func(args)
+    except subprocess.CalledProcessError as e:
+        die(f"command failed (exit {e.returncode})", e.returncode)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

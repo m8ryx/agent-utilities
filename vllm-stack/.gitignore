@@ -1,0 +1,4 @@
+# Secrets — everything compose substitutes at runtime.
+.env
+*.env
+!example.env
