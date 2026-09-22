@@ -2,7 +2,14 @@
 
 Miscellaneous tools, tips, tricks to make working with agents a bit easier.
 
-## The Goods
+I hope you find these handy. A few notes about my use cases:
+- CLI/TUI first - I prefer nvim to Code 
+- Multiple contexts, air-gapped. I have the desire and need to keep contexts safe from each other. 
+- Personal AI hosting - I picked up an RTX 5090 based machine to run workloads locally, for hobby and profession.
+- Linux - I use Linux. I haven't felt the need to use the new hotness, but instead run PopOS (which does have the new Costmic desktop, which is pretty cool). I've been running Debian family for decades, and was kicking around switching, but PopOS has good CUDA support.
+
+
+## The Goods - Utilities
 
 ### herdr-recycle-machines
 
@@ -23,6 +30,8 @@ Options:
   -h, --help        Show this help.
 ```
 With no --label and no positional arguments, every machine from `herdr machine list` is considered -- they are excluded if not in enabled state.
+
+## The Goods - Local LLM
 
 ### gpu
 
