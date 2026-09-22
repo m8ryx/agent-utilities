@@ -7,6 +7,7 @@ I hope you find these handy. A few notes about my use cases:
 - Multiple contexts, air-gapped. I have the desire and need to keep contexts safe from each other. 
 - Personal AI hosting - I picked up an RTX 5090 based machine to run workloads locally, for hobby and profession.
 - Linux - I use Linux. I haven't felt the need to use the new hotness, but instead run PopOS (which does have the new Costmic desktop, which is pretty cool). I've been running Debian family for decades, and was kicking around switching, but PopOS has good CUDA support.
+- tailscale - This is a new tool to me, but it's proven to be a game changer.
 
 
 ## The Goods - Utilities
